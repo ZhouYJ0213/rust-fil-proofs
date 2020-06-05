@@ -2,7 +2,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::marker::PhantomData;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{mpsc, Arc, RwLock};
 
 use generic_array::typenum::{self, Unsigned};
 use log::{info, trace};
@@ -384,7 +384,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         labels: &LabelsCache<Tree>,
     ) -> Result<DiskTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>>
     where
-        ColumnArity: PoseidonArity,
+        ColumnArity: 'static + PoseidonArity,
         TreeArity: PoseidonArity,
     {
         if settings::SETTINGS.lock().unwrap().use_gpu_column_builder {
@@ -414,7 +414,7 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
         labels: &LabelsCache<Tree>,
     ) -> Result<DiskTree<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>>
     where
-        ColumnArity: PoseidonArity,
+        ColumnArity: 'static + PoseidonArity,
         TreeArity: PoseidonArity,
     {
         info!("generating tree c using the GPU");
@@ -445,128 +445,153 @@ impl<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> StackedDrg<'a, Tr
                 max_gpu_tree_batch_size,
             )?;
 
-            for (i, config) in configs.iter().enumerate() {
-                let mut node_index = 0;
-                while node_index != nodes_count {
-                    let chunked_nodes_count =
-                        std::cmp::min(nodes_count - node_index, max_gpu_column_batch_size);
-                    trace!(
-                        "processing config {}/{} with column nodes {}",
-                        i + 1,
-                        tree_count,
-                        chunked_nodes_count,
-                    );
-                    let mut columns: Vec<GenericArray<Fr, ColumnArity>> =
-                        vec![
+            // This channel will receive batches of columns and add them to the ColumnTreeBuilder.
+            let (builder_tx, builder_rx) = mpsc::channel();
+
+            let config_count = configs.len(); // Don't move config into closure below.
+            rayon::scope(|s| {
+                s.spawn(move |_| {
+                    for i in 0..config_count {
+                        let mut node_index = 0;
+                        while node_index != nodes_count {
+                            let chunked_nodes_count =
+                                std::cmp::min(nodes_count - node_index, max_gpu_column_batch_size);
+                            trace!(
+                                "processing config {}/{} with column nodes {}",
+                                i + 1,
+                                tree_count,
+                                chunked_nodes_count,
+                            );
+                            let mut columns: Vec<GenericArray<Fr, ColumnArity>> = vec![
                             GenericArray::<Fr, ColumnArity>::generate(|_i: usize| Fr::zero());
                             chunked_nodes_count
                         ];
 
-                    // Allocate layer data array and insert a placeholder for each layer.
-                    let mut layer_data: Vec<Vec<Fr>> =
-                        vec![Vec::with_capacity(chunked_nodes_count); layers];
+                            // Allocate layer data array and insert a placeholder for each layer.
+                            let mut layer_data: Vec<Vec<Fr>> =
+                                vec![Vec::with_capacity(chunked_nodes_count); layers];
 
-                    rayon::scope(|s| {
-                        // capture a shadowed version of layer_data.
-                        let layer_data: &mut Vec<_> = &mut layer_data;
+                            rayon::scope(|s| {
+                                // capture a shadowed version of layer_data.
+                                let layer_data: &mut Vec<_> = &mut layer_data;
 
-                        // gather all layer data in parallel.
-                        s.spawn(move |_| {
-                            let labels = &labels;
-                            for (layer_index, layer_elements) in layer_data.iter_mut().enumerate() {
-                                let store = labels.labels_for_layer(layer_index + 1);
-                                let start = (i * nodes_count) + node_index;
-                                let end = start + chunked_nodes_count;
-                                let elements: Vec<<Tree::Hasher as Hasher>::Domain> =
-                                    store.read_range(std::ops::Range { start, end }).unwrap();
-                                layer_elements.extend(elements.into_iter().map(Into::into));
+                                // gather all layer data in parallel.
+                                s.spawn(move |_| {
+                                    // let labels = &labels;
+                                    for (layer_index, layer_elements) in
+                                        layer_data.iter_mut().enumerate()
+                                    {
+                                        let store = labels.labels_for_layer(layer_index + 1);
+                                        let start = (i * nodes_count) + node_index;
+                                        let end = start + chunked_nodes_count;
+                                        let elements: Vec<<Tree::Hasher as Hasher>::Domain> = store
+                                            .read_range(std::ops::Range { start, end })
+                                            .unwrap();
+                                        layer_elements.extend(elements.into_iter().map(Into::into));
+                                    }
+                                });
+                            });
+
+                            // Copy out all layer data arranged into columns.
+                            for layer_index in 0..layers {
+                                for index in 0..chunked_nodes_count {
+                                    columns[index][layer_index] = layer_data[layer_index][index];
+                                }
                             }
-                        });
-                    });
 
-                    // Copy out all layer data arranged into columns.
-                    for layer_index in 0..layers {
-                        for index in 0..chunked_nodes_count {
-                            columns[index][layer_index] = layer_data[layer_index][index];
+                            drop(layer_data);
+
+                            node_index += chunked_nodes_count;
+                            trace!(
+                                "node index {}/{}/{}",
+                                node_index,
+                                chunked_nodes_count,
+                                nodes_count,
+                            );
+
+                            let is_final = node_index == nodes_count;
+                            builder_tx.send((columns, is_final)).unwrap();
                         }
                     }
+                })
+            });
 
-                    drop(layer_data);
+            let mut i = 0;
+            let mut config = &configs[i];
 
-                    node_index += chunked_nodes_count;
-                    trace!(
-                        "node index {}/{}/{}",
-                        node_index,
-                        chunked_nodes_count,
-                        nodes_count,
-                    );
+            // Loop until all trees for all configs have been built.
+            while i < configs.len() {
+                let (columns, is_final) = builder_rx.recv().unwrap();
 
-                    if node_index != nodes_count {
-                        column_tree_builder.add_columns(&columns)?;
-                    } else {
-                        assert_eq!(node_index, nodes_count);
-                        let (base_data, tree_data) =
-                            column_tree_builder.add_final_columns(&columns)?;
-                        trace!(
-                            "base data len {}, tree data len {}",
-                            base_data.len(),
-                            tree_data.len()
-                        );
-                        let tree_len = base_data.len() + tree_data.len();
-                        info!(
-                            "persisting base tree_c {}/{} of length {}",
-                            i + 1,
-                            tree_count,
-                            tree_len,
-                        );
-                        assert_eq!(base_data.len(), nodes_count);
-                        assert_eq!(tree_len, config.size.unwrap());
+                // Just add non-final column batches.
+                if !is_final {
+                    column_tree_builder.add_columns(&columns)?;
+                    continue;
+                };
 
-                        // Persist the base and tree data to disk based using the current store config.
-                        let tree_c_store =
-                            DiskStore::<<Tree::Hasher as Hasher>::Domain>::new_with_config(
-                                tree_len,
-                                Tree::Arity::to_usize(),
-                                config.clone(),
-                            )?;
+                // If we get here, this is a final column: build a sub-tree.
+                let (base_data, tree_data) = column_tree_builder.add_final_columns(&columns)?;
+                trace!(
+                    "base data len {}, tree data len {}",
+                    base_data.len(),
+                    tree_data.len()
+                );
+                let tree_len = base_data.len() + tree_data.len();
+                info!(
+                    "persisting base tree_c {}/{} of length {}",
+                    i + 1,
+                    tree_count,
+                    tree_len,
+                );
+                assert_eq!(base_data.len(), nodes_count);
+                assert_eq!(tree_len, config.size.unwrap());
 
-                        let store = Arc::new(RwLock::new(tree_c_store));
-                        let batch_size = std::cmp::min(base_data.len(), column_write_batch_size);
-                        let flatten_and_write_store = |data: &Vec<Fr>, offset| {
-                            data.into_par_iter()
-                                .chunks(column_write_batch_size)
-                                .enumerate()
-                                .try_for_each(|(index, fr_elements)| {
-                                    let mut buf = Vec::with_capacity(batch_size * NODE_SIZE);
+                // Persist the base and tree data to disk based using the current store config.
+                let tree_c_store = DiskStore::<<Tree::Hasher as Hasher>::Domain>::new_with_config(
+                    tree_len,
+                    Tree::Arity::to_usize(),
+                    config.clone(),
+                )?;
 
-                                    for fr in fr_elements {
-                                        buf.extend(fr_into_bytes(&fr));
-                                    }
-                                    store
-                                        .write()
-                                        .unwrap()
-                                        .copy_from_slice(&buf[..], offset + (batch_size * index))
-                                })
-                        };
+                let store = Arc::new(RwLock::new(tree_c_store));
+                let batch_size = std::cmp::min(base_data.len(), column_write_batch_size);
+                let flatten_and_write_store = |data: &Vec<Fr>, offset| {
+                    data.into_par_iter()
+                        .chunks(column_write_batch_size)
+                        .enumerate()
+                        .try_for_each(|(index, fr_elements)| {
+                            let mut buf = Vec::with_capacity(batch_size * NODE_SIZE);
 
-                        trace!(
-                            "flattening tree_c base data of {} nodes using batch size {}",
-                            base_data.len(),
-                            batch_size
-                        );
-                        flatten_and_write_store(&base_data, 0)?;
-                        trace!("done flattening tree_c base data");
+                            for fr in fr_elements {
+                                buf.extend(fr_into_bytes(&fr));
+                            }
+                            store
+                                .write()
+                                .unwrap()
+                                .copy_from_slice(&buf[..], offset + (batch_size * index))
+                        })
+                };
 
-                        let base_offset = base_data.len();
-                        trace!("flattening tree_c tree data of {} nodes using batch size {} and base offset {}", tree_data.len(), batch_size, base_offset);
-                        flatten_and_write_store(&tree_data, base_offset)?;
-                        trace!("done flattening tree_c tree data");
+                trace!(
+                    "flattening tree_c base data of {} nodes using batch size {}",
+                    base_data.len(),
+                    batch_size
+                );
+                flatten_and_write_store(&base_data, 0)?;
+                trace!("done flattening tree_c base data");
 
-                        trace!("writing tree_c store data");
-                        store.write().unwrap().sync()?;
-                        trace!("done writing tree_c store data");
-                    }
-                }
+                let base_offset = base_data.len();
+                trace!("flattening tree_c tree data of {} nodes using batch size {} and base offset {}", tree_data.len(), batch_size, base_offset);
+                flatten_and_write_store(&tree_data, base_offset)?;
+                trace!("done flattening tree_c tree data");
+
+                trace!("writing tree_c store data");
+                store.write().unwrap().sync()?;
+                trace!("done writing tree_c store data");
+
+                // Move on to the next config.
+                i += 1;
+                config = &configs[i];
             }
 
             create_disk_tree::<
